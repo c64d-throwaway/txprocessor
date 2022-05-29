@@ -234,7 +234,9 @@ fn insert_tx(conn: &SqlConnection, tx: &Tx) -> Result<()> {
     Ok(())
 }
 
-fn handle_deposit(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+fn handle_deposit(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
+    let mut dbtx = conn.transaction()?;
+
     let num_of_records: i64 = dbtx.query_row(
         "SELECT count(id) FROM tx where id = ?1",
         params![&tx.id],
@@ -242,7 +244,7 @@ fn handle_deposit(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
     )?;
 
     if num_of_records == 1 {
-        dbtx.rollback()?;
+        dbtx.rollback().context("failed rolling back transaction")?;
         return Ok(());
     }
 
@@ -256,10 +258,15 @@ fn handle_deposit(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
         params![tx.id, tx.tx_type, tx.client_id, tx.amount],
     )
     .map(|_| ())
-    .context("failed inserting processed transaction on deposit")
+    .context("failed inserting processed transaction on deposit")?;
+
+    dbtx.commit().map(|_|()).context("failed committing on deposit")
+
 }
 
-fn handle_withdrawal(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+fn handle_withdrawal(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
+    let mut dbtx = conn.transaction()?;
+
     let num_of_records: i64 = dbtx.query_row(
         "SELECT count(id) FROM tx where id = ?1",
         params![&tx.id],
@@ -267,7 +274,7 @@ fn handle_withdrawal(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
     )?;
 
     if num_of_records == 1 {
-        dbtx.rollback()?;
+        dbtx.rollback().context("failed rolling back transaction")?;
         return Ok(());
     }
 
@@ -281,10 +288,15 @@ fn handle_withdrawal(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
         params![tx.id, tx.tx_type, tx.client_id, tx.amount],
     )
     .map(|x| ())
-    .context("failed inserting processed transaction on withdrawal")
+    .context("failed inserting processed transaction on withdrawal")?;
+
+    dbtx.commit().map(|_|()).context("failed committing on withdrawal")
+
 }
 
-fn handle_dispute(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
+    let mut dbtx = conn.transaction()?;
+
     let txrecord = dbtx.query_row(
         "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
         params![&tx.client_id, &tx.id, TxStatus::Processed.to_string()], |r| {
@@ -302,17 +314,21 @@ fn handle_dispute(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::InDispute],
     )
-    .expect("failed updating tx status on dispute")?;
+    .context("failed updating tx status on dispute")?;
 
     dbtx.execute(
         "UPDATE account SET available_amount = available_amount - ?1, held_amount = held_amount + ?1 WHERE id = ?2;",
         params![txrecord.amount, txrecord.client_id],
     )
         .map(|x| ())
-        .context("failed updating account on dispute")
+        .context("failed updating account on dispute")?;
+
+    dbtx.commit().map(|_|()).context("failed committing on dispute")
 }
 
-fn handle_resolve(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+fn handle_resolve(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
+    let mut dbtx = conn.transaction()?;
+
     let txrecord = dbtx.query_row(
         "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
         params![&tx.client_id, &tx.id, TxStatus::InDispute.to_string()],
@@ -338,10 +354,14 @@ fn handle_resolve(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
         params![txrecord.amount, txrecord.client_id],
     )
         .map(|x| ())
-        .context("failed updating account on resolve")
+        .context("failed updating account on resolve")?;
+
+    dbtx.commit().map(|_|()).context("failed committing resolve")
 }
 
-fn handle_chargeback(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+fn handle_chargeback(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
+    let mut dbtx = conn.transaction()?;
+
     let txrecord = dbtx.query_row(
         "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
         params![ & tx.client_id, & tx.id, TxStatus::InDispute.to_string()],
@@ -368,21 +388,20 @@ fn handle_chargeback(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
         params![txrecord.amount, AccountStatus::Blocked, txrecord.client_id],
     )
     .map(|x| ())
-    .context("failed updating account on chargeback")
+    .context("failed updating account on chargeback")?;
+
+    dbtx.commit().map(|_|()).context("failed committing chargeback")
 }
 
 fn handle_tx(conn: &mut SqlConnection, tx: Tx) -> Result<()> {
-    let dbtx = conn.transaction()?;
-
     let res = match tx.tx_type {
-        TxType::Deposit => handle_deposit(&dbtx, &tx),
-        TxType::Withdrawal => handle_withdrawal(&dbtx, &tx),
-        TxType::Dispute => handle_dispute(&dbtx, &tx),
-        TxType::Resolve => handle_resolve(&dbtx, &tx),
-        TxType::Chargeback => handle_chargeback(&dbtx, &tx),
+        TxType::Deposit => handle_deposit(conn, &tx),
+        TxType::Withdrawal => handle_withdrawal(conn, &tx),
+        TxType::Dispute => handle_dispute(conn, &tx),
+        TxType::Resolve => handle_resolve(conn, &tx),
+        TxType::Chargeback => handle_chargeback(conn, &tx),
     };
     res.context("failed handling transaction")?;
-    dbtx.commit().context("failed committing sql transaction")?;
     Ok(())
 }
 
@@ -408,7 +427,7 @@ fn main() -> Result<()> {
 
 // TODO
 // ~~1. add status to account and block upon chargeback~~
-// 2. split actions to functions
+// ~~2. split actions to functions~~
 // 3. serialize the account as CSV
 // 4. run queue on own process?
 // 5. shard the queue and database?
