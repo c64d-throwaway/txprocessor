@@ -1,16 +1,19 @@
+use crate::TxStatus::{InDispute, Processed};
 use anyhow::{Context, Result};
 use rusqlite::{
     params, types::ToSqlOutput, Connection as SqlConnection, Error as SqlError, OptionalExtension,
     Result as SqlResult, ToSql,
+};
+use rusqlite::{
+    types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
+    Transaction as SqlTransaction,
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_derive::Deserialize as SerdeDeserialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use strum_macros::{Display, EnumString};
-use crate::TxStatus::{InDispute, Processed};
 
 type ClientId = u16;
 type TxId = u32;
@@ -54,8 +57,8 @@ enum TxType {
 
 impl<'de> Deserialize<'de> for TxType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -79,6 +82,18 @@ impl ToSql for TxType {
     }
 }
 
+impl FromSql for TxType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "deposit" => Ok(TxType::Deposit),
+            "withdrawal" => Ok(TxType::Withdrawal),
+            "dispute" => Ok(TxType::Dispute),
+            "resolve" => Ok(TxType::Resolve),
+            "chargeback" => Ok(TxType::Chargeback),
+            _ => Err(FromSqlError::from(FromSqlError::InvalidType)),
+        }
+    }
+}
 
 #[derive(Debug, EnumString, Display)]
 enum TxStatus {
@@ -94,8 +109,8 @@ enum TxStatus {
 
 impl<'de> Deserialize<'de> for TxStatus {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -129,7 +144,6 @@ impl FromSql for TxStatus {
     }
 }
 
-
 #[derive(Debug, EnumString, Display)]
 enum AccountStatus {
     #[strum(to_string = "active", serialize = "active")]
@@ -146,12 +160,12 @@ impl ToSql for AccountStatus {
     }
 }
 
-impl FromSql for TxSAccountStatustatus {
+impl FromSql for AccountStatus {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         match value.as_str()? {
-            "active" => Ok(TxStatus::Processed),
-            "blocked" => Ok(TxStatus::InDispute),
-            "inactive" => Ok(TxStatus::Resolved),
+            "active" => Ok(AccountStatus::Active),
+            "blocked" => Ok(AccountStatus::Blocked),
+            "inactive" => Ok(AccountStatus::Inactive),
             _ => Err(FromSqlError::from(FromSqlError::InvalidType)),
         }
     }
@@ -215,144 +229,160 @@ fn insert_tx(conn: &SqlConnection, tx: &Tx) -> Result<()> {
         "INSERT INTO tx (id, tx_type, client_id, amount, status) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![tx.id, tx.tx_type.to_string(), tx.client_id, tx.amount],
     )
-        .context("unable to insert tx to table")?;
+    .context("unable to insert tx to table")?;
 
     Ok(())
+}
+
+fn handle_deposit(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+    let num_of_records: i64 = dbtx.query_row(
+        "SELECT count(id) FROM tx where id = ?1",
+        params![&tx.id],
+        |row| Ok(row.get(0)?),
+    )?;
+
+    if num_of_records == 1 {
+        dbtx.rollback()?;
+        return Ok(());
+    }
+
+    dbtx.execute(
+        "UPDATE account SET available_amount = available_amount + ?1 WHERE id = ?2 AND status = ?3;",
+        params![tx.amount, tx.client_id, AccountStatus::Active])
+        .context("failed updating account amount on deposit")?;
+
+    dbtx.execute(
+        "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
+        params![tx.id, tx.tx_type, tx.client_id, tx.amount],
+    )
+    .map(|_| ())
+    .context("failed inserting processed transaction on deposit")
+}
+
+fn handle_withdrawal(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+    let num_of_records: i64 = dbtx.query_row(
+        "SELECT count(id) FROM tx where id = ?1",
+        params![&tx.id],
+        |row| Ok(row.get(0)?),
+    )?;
+
+    if num_of_records == 1 {
+        dbtx.rollback()?;
+        return Ok(());
+    }
+
+    dbtx.execute(
+        "UPDATE account SET available_amount = available_amount - ?1 WHERE id = ?2 AND status = ?3 AND available_amount >= ?1;",
+        params![tx.amount, tx.client_id, AccountStatus::Active])
+        .context("failed updating account transaction on withdrawal")?;
+
+    dbtx.execute(
+        "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
+        params![tx.id, tx.tx_type, tx.client_id, tx.amount],
+    )
+    .map(|x| ())
+    .context("failed inserting processed transaction on withdrawal")
+}
+
+fn handle_dispute(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+    let txrecord = dbtx.query_row(
+        "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
+        params![&tx.client_id, &tx.id, TxStatus::Processed.to_string()], |r| {
+            let id: u32 = r.get(0)?;
+            Ok(SqlTx {
+                id,
+                tx_type: r.get(1)?,
+                client_id: r.get(2)?,
+                amount: r.get(3)?,
+                status: r.get(4)?,
+            })
+        }).unwrap();
+
+    dbtx.execute(
+        "UPDATE tx SET status = ?2 WHERE id = ?1;",
+        params![&txrecord.id, TxStatus::InDispute],
+    )
+    .expect("failed updating tx status on dispute")?;
+
+    dbtx.execute(
+        "UPDATE account SET available_amount = available_amount - ?1, held_amount = held_amount + ?1 WHERE id = ?2;",
+        params![txrecord.amount, txrecord.client_id],
+    )
+        .map(|x| ())
+        .context("failed updating account on dispute")
+}
+
+fn handle_resolve(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+    let txrecord = dbtx.query_row(
+        "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
+        params![&tx.client_id, &tx.id, TxStatus::InDispute.to_string()],
+        |r| {
+            let id: u32 = r.get(0)?;
+            Ok(SqlTx {
+                id,
+                tx_type: r.get(1)?,
+                client_id: r.get(2)?,
+                amount: r.get(3)?,
+                status: r.get(4)?,
+            })
+        }).unwrap();
+
+    dbtx.execute(
+        "UPDATE tx SET status = ?2 WHERE id = ?1;",
+        params![&txrecord.id, TxStatus::Resolved],
+    )
+    .context("failed updating tx status on resolve");
+
+    dbtx.execute(
+        "UPDATE account SET available_amount = available_amount + ?1, held_amount = held_amount - ?1 WHERE id = ?2;",
+        params![txrecord.amount, txrecord.client_id],
+    )
+        .map(|x| ())
+        .context("failed updating account on resolve")
+}
+
+fn handle_chargeback(dbtx: &SqlTransaction, tx: &Tx) -> Result<()> {
+    let txrecord = dbtx.query_row(
+        "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
+        params![ & tx.client_id, & tx.id, TxStatus::InDispute.to_string()],
+        |r| {
+            let id: u32 = r.get(0)?;
+            Ok(SqlTx {
+                id,
+                tx_type: TxType::Deposit, // fixme!!!!
+                client_id: r.get(2)?,
+                amount: r.get(3)?,
+                status: r.get(4)?,
+            })
+        }).unwrap();
+
+    dbtx.execute(
+        "UPDATE tx SET status = ?2 WHERE id = ?1;",
+        params![&txrecord.id, TxStatus::Chargeback],
+    )
+    .context("failed updating transaction status on chargeback")?;
+
+    // fix block the fucking user
+    dbtx.execute(
+        "UPDATE account SET held_amount = held_amount - ?1, status = ?2 WHERE id = ?3;",
+        params![txrecord.amount, AccountStatus::Blocked, txrecord.client_id],
+    )
+    .map(|x| ())
+    .context("failed updating account on chargeback")
 }
 
 fn handle_tx(conn: &mut SqlConnection, tx: Tx) -> Result<()> {
     let dbtx = conn.transaction()?;
 
-    let a = match tx.tx_type {
-        TxType::Deposit => {
-            let num_of_records: i64 = dbtx.query_row(
-                "SELECT count(id) FROM tx where id = ?1",
-                params![&tx.id],
-                |row| Ok(row.get(0)?),
-            )?;
-            if num_of_records == 1 {
-                dbtx.rollback()?;
-                return Ok(());
-            }
-
-            dbtx.execute(
-                "UPDATE account SET available_amount = available_amount + ?1 WHERE id = ?2;",
-                params![tx.amount, tx.client_id])
-                .map(|x| ())
-                .and_then(|_|
-                    dbtx.execute(
-                        "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
-                        params![tx.id, tx.tx_type, tx.client_id, tx.amount])
-                        .map(|x| ()))
-        }
-
-        TxType::Withdrawal => {
-            let num_of_records: i64 = dbtx.query_row(
-                "SELECT count(id) FROM tx where id = ?1",
-                params![&tx.id],
-                |row| Ok(row.get(0)?),
-            )?;
-            if num_of_records == 1 {
-                dbtx.rollback()?;
-                return Ok(());
-            }
-
-            dbtx.execute(
-                "UPDATE account SET available_amount = available_amount - ?1 WHERE id = ?2 AND available_amount >= ?1;",
-                params![tx.amount, tx.client_id])
-                .map(|x| ())
-                .and_then(|_|
-                    dbtx.execute(
-                        "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
-                        params![tx.id, tx.tx_type, tx.client_id, tx.amount])
-                        .map(|x| ()))
-        }
-
-        TxType::Dispute => {
-            let txrecord = dbtx.query_row(
-                "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
-                params![&tx.client_id, &tx.id, TxStatus::Processed.to_string()], |r| {
-                    let id: u32 = r.get(0)?;
-                    Ok(SqlTx {
-                        id,
-                        tx_type: TxType::Deposit, // fixme!!!!
-                        client_id: r.get(2)?,
-                        amount: r.get(3)?,
-                        status: r.get(4)?,
-                    })
-                }).unwrap();
-
-
-            dbtx.execute(
-                "UPDATE tx SET status = ?2 WHERE id = ?1;",
-                params![&txrecord.id, TxStatus::InDispute],
-            ).map(|x| ()).unwrap();
-
-            dbtx.execute(
-                "UPDATE account SET available_amount = available_amount - ?1, held_amount = held_amount + ?1 WHERE id = ?2;",
-                params![txrecord.amount, txrecord.client_id],
-            ).map(|x| ()).unwrap();
-
-            Ok(())
-        }
-        TxType::Resolve => {
-            let txrecord = dbtx.query_row(
-                "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
-                params![&tx.client_id, &tx.id, TxStatus::InDispute.to_string()], |r| {
-                    let id: u32 = r.get(0)?;
-                    Ok(SqlTx {
-                        id,
-                        tx_type: TxType::Deposit, // fixme!!!!
-                        client_id: r.get(2)?,
-                        amount: r.get(3)?,
-                        status: r.get(4)?,
-                    })
-                }).unwrap();
-
-
-            dbtx.execute(
-                "UPDATE tx SET status = ?2 WHERE id = ?1;",
-                params![&txrecord.id, TxStatus::Resolved],
-            ).map(|x| ()).unwrap();
-
-            dbtx.execute(
-                "UPDATE account SET available_amount = available_amount + ?1, held_amount = held_amount - ?1 WHERE id = ?2;",
-                params![txrecord.amount, txrecord.client_id],
-            ).map(|x| ()).unwrap();
-
-            Ok(())
-        }
-        TxType::Chargeback => {
-            let txrecord = dbtx.query_row(
-                "select id, tx_type, client_id, amount, status from tx where status = ?3 and client_id = ?1 and id = ?2;",
-                params![&tx.client_id, &tx.id, TxStatus::InDispute.to_string()], |r| {
-                    let id: u32 = r.get(0)?;
-                    Ok(SqlTx {
-                        id,
-                        tx_type: TxType::Deposit, // fixme!!!!
-                        client_id: r.get(2)?,
-                        amount: r.get(3)?,
-                        status: r.get(4)?,
-                    })
-                }).unwrap();
-
-
-            dbtx.execute(
-                "UPDATE tx SET status = ?2 WHERE id = ?1;",
-                params![&txrecord.id, TxStatus::Chargeback],
-            ).map(|x| ()).unwrap();
-
-            // fix block the fucking user
-            dbtx.execute(
-                "UPDATE account SET held_amount = held_amount - ?1, status = ?2 WHERE id = ?3;",
-                params![txrecord.amount, AccountStatus::Blocked, txrecord.client_id],
-            ).map(|x| ()).unwrap();
-
-            Ok(())
-        }
+    let res = match tx.tx_type {
+        TxType::Deposit => handle_deposit(&dbtx, &tx),
+        TxType::Withdrawal => handle_withdrawal(&dbtx, &tx),
+        TxType::Dispute => handle_dispute(&dbtx, &tx),
+        TxType::Resolve => handle_resolve(&dbtx, &tx),
+        TxType::Chargeback => handle_chargeback(&dbtx, &tx),
     };
-    a.unwrap();
-    dbtx.commit()?;
+    res.context("failed handling transaction")?;
+    dbtx.commit().context("failed committing sql transaction")?;
     Ok(())
 }
 
@@ -361,7 +391,7 @@ fn main() -> Result<()> {
     let txs = read_csv(PathBuf::from("./src/testfile.csv")).unwrap();
     let mut queue = TxQueue::new();
 
-    conn.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT ?1);", params![TxStatus::Processed]).unwrap();
+    conn.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT 'processed');", []).unwrap();
     conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, available_amount DOUBLE PRECISION , held_amount DOUBLE PRECISION, locked BOOLEAN, status TEXT DEFAULT 'active');", []).unwrap();
     conn.execute("INSERT OR IGNORE INTO account (id, available_amount, held_amount, locked) values (1, 0.0, 0.0, false)", []).unwrap();
     conn.execute("INSERT OR IGNORE INTO account (id, available_amount, held_amount, locked) values (2, 0.0, 0.0, false)", []).unwrap();
@@ -376,9 +406,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
 // TODO
-// 1. add status to account and block upon chargeback
+// ~~1. add status to account and block upon chargeback~~
 // 2. split actions to functions
 // 3. serialize the account as CSV
 // 4. run queue on own process?
