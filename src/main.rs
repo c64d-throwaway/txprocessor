@@ -1,15 +1,13 @@
-extern crate core;
-
 use anyhow::{anyhow, Context, Result};
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{
-    params, types::ToSqlOutput, Connection as SqlConnection, Error as SqlError,
-    Result as SqlResult, ToSql, Transaction as SqlTransaction,
+    params,
+    types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+    Connection as SqlConnection, Error as SqlError, Result as SqlResult, ToSql,
+    Transaction as SqlTransaction,
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_derive::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use std::collections::VecDeque;
-use std::fs::OpenOptions;
+use std::{collections::VecDeque, fs::OpenOptions};
 use strum_macros::{Display, EnumString};
 
 type ClientId = u16;
