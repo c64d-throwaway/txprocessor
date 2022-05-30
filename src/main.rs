@@ -1,20 +1,15 @@
-use crate::TxStatus::{InDispute, Processed};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{
-    params, types::ToSqlOutput, Connection as SqlConnection, Error as SqlError, OptionalExtension,
+    params, types::ToSqlOutput, Connection as SqlConnection, Error as SqlError,
     Result as SqlResult, ToSql,
-};
-use rusqlite::{
-    types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
-    Transaction as SqlTransaction,
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_derive::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::io::Read;
 use strum_macros::{Display, EnumString};
-use std::io::Write;
 
 type ClientId = u16;
 type TxId = u32;
@@ -44,22 +39,22 @@ struct SqlTx {
 
 #[derive(Debug, EnumString, Display)]
 enum TxType {
-    #[strum(to_string = "deposit", serialize = "deposit")]
+    #[strum(serialize = "deposit")]
     Deposit,
-    #[strum(to_string = "withdrawal", serialize = "withdrawal")]
+    #[strum(serialize = "withdrawal")]
     Withdrawal,
-    #[strum(to_string = "dispute", serialize = "dispute")]
+    #[strum(serialize = "dispute")]
     Dispute,
-    #[strum(to_string = "resolve", serialize = "resolve")]
+    #[strum(serialize = "resolve")]
     Resolve,
-    #[strum(to_string = "chargeback", serialize = "chargeback")]
+    #[strum(serialize = "chargeback")]
     Chargeback,
 }
 
 impl<'de> Deserialize<'de> for TxType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -91,27 +86,27 @@ impl FromSql for TxType {
             "dispute" => Ok(TxType::Dispute),
             "resolve" => Ok(TxType::Resolve),
             "chargeback" => Ok(TxType::Chargeback),
-            _ => Err(FromSqlError::from(FromSqlError::InvalidType)),
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
 
 #[derive(Debug, EnumString, Display)]
 enum TxStatus {
-    #[strum(to_string = "processed", serialize = "processed")]
+    #[strum(serialize = "processed")]
     Processed,
-    #[strum(to_string = "in_dispute", serialize = "in_dispute")]
+    #[strum(serialize = "in_dispute")]
     InDispute,
-    #[strum(to_string = "resolved", serialize = "resolved")]
+    #[strum(serialize = "resolved")]
     Resolved,
-    #[strum(to_string = "chargeback", serialize = "chargeback")]
+    #[strum(serialize = "chargeback")]
     Chargeback,
 }
 
 impl<'de> Deserialize<'de> for TxStatus {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -140,18 +135,18 @@ impl FromSql for TxStatus {
             "processed" => Ok(TxStatus::Processed),
             "in_dispute" => Ok(TxStatus::InDispute),
             "resolved" => Ok(TxStatus::Resolved),
-            _ => Err(FromSqlError::from(FromSqlError::InvalidType)),
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
 
 #[derive(Debug, EnumString, Display)]
 enum AccountStatus {
-    #[strum(to_string = "active", serialize = "active")]
+    #[strum(serialize = "active")]
     Active,
-    #[strum(to_string = "blocked", serialize = "blocked")]
+    #[strum(serialize = "blocked")]
     Blocked,
-    #[strum(to_string = "inactive", serialize = "inactive")]
+    #[strum(serialize = "inactive")]
     Inactive,
 }
 
@@ -167,30 +162,18 @@ impl FromSql for AccountStatus {
             "active" => Ok(AccountStatus::Active),
             "blocked" => Ok(AccountStatus::Blocked),
             "inactive" => Ok(AccountStatus::Inactive),
-            _ => Err(FromSqlError::from(FromSqlError::InvalidType)),
+            _ => Err(FromSqlError::InvalidType),
         }
     }
 }
 
-#[derive(SerdeSerialize)]
+#[derive(Debug, PartialEq, SerdeSerialize)]
 struct Account {
     pub client_id: ClientId,
     pub available: Amount,
     pub held: Amount,
     pub total: Amount,
     pub locked: bool,
-}
-
-impl Account {
-    fn new(client_id: ClientId) -> Self {
-        Account {
-            client_id,
-            available: 0f64,
-            held: 0f64,
-            total: 0f64,
-            locked: false,
-        }
-    }
 }
 
 fn to_csv(accounts: Vec<Account>) -> Result<String> {
@@ -201,35 +184,42 @@ fn to_csv(accounts: Vec<Account>) -> Result<String> {
         builder.serialize(acc)?;
     }
 
-    let bytes = builder.into_inner().context("failed flushing into buffer or file")?;
+    let bytes = builder
+        .into_inner()
+        .context("failed flushing into buffer or file")?;
     String::from_utf8(bytes).context("failed converting csv to string from byte vector")
 }
 
 fn from_sql_table(conn: &SqlConnection) -> Result<Vec<Account>> {
-    let mut q = conn.prepare("SELECT id, available_amount, held_amount, locked, status from account;")
-        .map_err(|err| anyhow::Error::from(err))?;
+    let mut q = conn
+        .prepare("SELECT id, available_amount, held_amount, locked, status from account;")
+        .map_err(anyhow::Error::from)?;
 
-    let m = q.query_map([], |row| {
-        let available = row.get(1)?;
-        let held = row.get(2)?;
-        let total = available + held;
-        Ok(Account {
-            client_id: row.get(0)?,
-            available,
-            held,
-            total,
-            locked: row.get(3)?,
+    let m = q
+        .query_map([], |row| {
+            let available = row.get(1)?;
+            let held = row.get(2)?;
+            let total = available + held;
+            let status: String = row.get(4)?;
+            let locked = status == AccountStatus::Blocked.to_string();
+
+            Ok(Account {
+                client_id: row.get(0)?,
+                available,
+                held,
+                total,
+                locked,
+            })
         })
-    }).map_err(|err| anyhow::Error::from(err))?;
+        .map_err(anyhow::Error::from)?;
 
     let a = m.map(|x| x.unwrap()).collect::<_>();
 
     Ok(a)
 }
 
-fn read_csv(path: PathBuf) -> Result<Vec<Tx>> {
-    let a = OpenOptions::new().read(true).open(path).unwrap();
-    let mut b = csv::Reader::from_reader(a);
+fn read_csv(rdr: impl Read) -> Result<Vec<Tx>> {
+    let mut b = csv::Reader::from_reader(rdr);
     b.deserialize()
         .map(|x| {
             let tx: Tx = x.context("failed deserializing csv record into a transaction")?;
@@ -254,29 +244,15 @@ impl TxQueue {
     pub fn pop(&mut self) -> Option<Tx> {
         self.q.pop_front()
     }
-
-    pub fn len(&self) -> usize {
-        self.q.len()
-    }
-}
-
-fn insert_tx(conn: &SqlConnection, tx: &Tx) -> Result<()> {
-    conn.execute(
-        "INSERT INTO tx (id, tx_type, client_id, amount, status) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![tx.id, tx.tx_type.to_string(), tx.client_id, tx.amount],
-    )
-        .context("unable to insert tx to table")?;
-
-    Ok(())
 }
 
 fn handle_deposit(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
-    let mut dbtx = conn.transaction()?;
+    let dbtx = conn.transaction()?;
 
     let num_of_records: i64 = dbtx.query_row(
         "SELECT count(id) FROM tx where id = ?1",
         params![&tx.id],
-        |row| Ok(row.get(0)?),
+        |row| row.get(0),
     )?;
 
     if num_of_records == 1 {
@@ -291,7 +267,6 @@ fn handle_deposit(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         return Err(anyhow::Error::new(e));
     }
 
-
     if let Err(e) = dbtx.execute(
         "UPDATE account SET available_amount = available_amount + ?1 WHERE id = ?2 AND status = ?3;",
         params![tx.amount, tx.client_id, AccountStatus::Active])
@@ -300,24 +275,29 @@ fn handle_deposit(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         return Err(anyhow::Error::new(e));
     }
 
-    if let Err(e) = dbtx.execute(
-        "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
-        params![tx.id, tx.tx_type, tx.client_id, tx.amount],
-    ).map(|_| ()) {
+    if let Err(e) = dbtx
+        .execute(
+            "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
+            params![tx.id, tx.tx_type, tx.client_id, tx.amount],
+        )
+        .map(|_| ())
+    {
         dbtx.rollback().context("failed rolling back transaction")?;
         return Err(anyhow::Error::new(e));
     }
 
-    dbtx.commit().map(|_| ()).context("failed committing on deposit")
+    dbtx.commit()
+        .map(|_| ())
+        .context("failed committing on deposit")
 }
 
 fn handle_withdrawal(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
-    let mut dbtx = conn.transaction()?;
+    let dbtx = conn.transaction()?;
 
     let num_of_records: i64 = dbtx.query_row(
         "SELECT count(id) FROM tx where id = ?1",
         params![&tx.id],
-        |row| Ok(row.get(0)?),
+        |row| row.get(0),
     )?;
 
     if num_of_records == 1 {
@@ -334,14 +314,16 @@ fn handle_withdrawal(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
         params![tx.id, tx.tx_type, tx.client_id, tx.amount],
     )
-        .map(|x| ())
-        .context("failed inserting processed transaction on withdrawal")?;
+    .map(|_| ())
+    .context("failed inserting processed transaction on withdrawal")?;
 
-    dbtx.commit().map(|_| ()).context("failed committing on withdrawal")
+    dbtx.commit()
+        .map(|_| ())
+        .context("failed committing on withdrawal")
 }
 
 fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
-    let mut dbtx = conn.transaction()?;
+    let dbtx = conn.transaction()?;
 
     let txrecordres = dbtx.query_row(
         "SELECT id, tx_type, client_id, amount, status FROM tx WHERE status = ?3 AND client_id = ?1 AND id = ?2;",
@@ -371,20 +353,22 @@ fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::InDispute],
     )
-        .context("failed updating tx status on dispute")?;
+    .context("failed updating tx status on dispute")?;
 
     dbtx.execute(
         "UPDATE account SET available_amount = available_amount - ?1, held_amount = held_amount + ?1 WHERE id = ?2;",
         params![txrecord.amount, txrecord.client_id],
     )
-        .map(|x| ())
+        .map(|_| ())
         .context("failed updating account on dispute")?;
 
-    dbtx.commit().map(|_| ()).context("failed committing on dispute")
+    dbtx.commit()
+        .map(|_| ())
+        .context("failed committing on dispute")
 }
 
 fn handle_resolve(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
-    let mut dbtx = conn.transaction()?;
+    let dbtx = conn.transaction()?;
 
     let txrecordres = dbtx.query_row(
         "SELECT id, tx_type, client_id, amount, status FROM tx WHERE status = ?3 AND client_id = ?1 AND id = ?2;",
@@ -414,24 +398,26 @@ fn handle_resolve(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::Resolved],
     )
-        .context("failed updating tx status on resolve");
+    .context("failed updating tx status on resolve")?;
 
     dbtx.execute(
         "UPDATE account SET available_amount = available_amount + ?1, held_amount = held_amount - ?1 WHERE id = ?2;",
         params![txrecord.amount, txrecord.client_id],
     )
-        .map(|x| ())
+        .map(|_| ())
         .context("failed updating account on resolve")?;
 
-    dbtx.commit().map(|_| ()).context("failed committing resolve")
+    dbtx.commit()
+        .map(|_| ())
+        .context("failed committing resolve")
 }
 
 fn handle_chargeback(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
-    let mut dbtx = conn.transaction()?;
+    let dbtx = conn.transaction()?;
 
     let txrecordres = dbtx.query_row(
         "SELECT id, tx_type, client_id, amount, status FROM tx WHERE status = ?3 AND client_id = ?1 AND id = ?2;",
-        params![&tx.client_id, &tx.id, TxStatus::Processed.to_string()], |r| {
+        params![&tx.client_id, &tx.id, TxStatus::InDispute], |r| {
             let id: u32 = r.get(0)?;
             Ok(SqlTx {
                 id,
@@ -457,16 +443,20 @@ fn handle_chargeback(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::Chargeback],
     )
-        .context("failed updating transaction status on chargeback")?;
+    .context("failed updating transaction status on chargeback")?;
 
     dbtx.execute(
         "UPDATE account SET held_amount = held_amount - ?1, status = ?2 WHERE id = ?3;",
         params![txrecord.amount, AccountStatus::Blocked, txrecord.client_id],
     )
-        .map(|x| ())
-        .context("failed updating account on chargeback")?;
+    .map(|_| ())
+    .context("failed updating account on chargeback")?;
 
-    dbtx.commit().map(|_| ()).context("failed committing chargeback")
+    dbtx.commit()
+        .map(|_| ())
+        .context("failed committing chargeback")?;
+
+    Ok(())
 }
 
 fn handle_tx(conn: &mut SqlConnection, tx: Tx) -> Result<()> {
@@ -479,45 +469,218 @@ fn handle_tx(conn: &mut SqlConnection, tx: Tx) -> Result<()> {
     }
 }
 
-fn main() -> Result<()> {
-    let mut conn = SqlConnection::open("test.db")?;
+fn migrate_tables(conn: &SqlConnection) -> Result<()> {
+    conn.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT 'processed');", [])
+        .context("failed migrating tx table")?;
 
+    conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, available_amount DOUBLE PRECISION , held_amount DOUBLE PRECISION, locked BOOLEAN, status TEXT DEFAULT 'active');", [])
+        .context("failed migrating account table").map(|_| ())
+}
+
+fn source_file_from_args() -> Result<String> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 2 {
-        return Err(anyhow::anyhow!("expected 1 argument, got {}. Try cargo run -- transactions.csv > accounts.csv", args.len()));
+        return Err(anyhow::anyhow!(
+            "expected 1 argument, got {}. Try cargo run -- transactions.csv > accounts.csv",
+            args.len()
+        ));
     }
 
-    let input_path = &args[1];
+    Ok(args[1].clone())
+}
 
-    let txs = read_csv(PathBuf::from(input_path)).unwrap();
+fn main() -> Result<()> {
+    let mut conn = SqlConnection::open("test.db")?;
+    migrate_tables(&conn)?;
+    let input_path = source_file_from_args()?;
+
+    let txfile = OpenOptions::new().read(true).open(&input_path)?;
+    let txs = read_csv(txfile)?;
     let mut queue = TxQueue::new();
-
-    conn.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT 'processed');", []).unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, available_amount DOUBLE PRECISION , held_amount DOUBLE PRECISION, locked BOOLEAN, status TEXT DEFAULT 'active');", []).unwrap();
 
     for tx in txs {
         queue.push(tx);
     }
 
     while let Some(tx) = queue.pop() {
-        handle_tx(&mut conn, tx);
+        handle_tx(&mut conn, tx)?;
     }
 
     println!("{}", to_csv(from_sql_table(&conn)?)?);
+    conn.close().unwrap();
     Ok(())
 }
 
 #[cfg(test)]
 mod component_tests {
+    use crate::{from_sql_table, handle_tx, migrate_tables, read_csv, Account, TxQueue};
+    use anyhow::Result;
+    use rusqlite::Connection as SqlConnection;
+
+    fn setup() -> Result<SqlConnection> {
+        let conn = SqlConnection::open_in_memory().unwrap();
+        migrate_tables(&conn)?;
+
+        return Ok(conn);
+    }
+
+    fn run(conn: &mut SqlConnection, csv: &str) -> Result<()> {
+        let buf = std::io::BufReader::new(csv.as_bytes());
+        let txs = read_csv(buf)?;
+
+        let mut queue = TxQueue::new();
+
+        for tx in txs {
+            queue.push(tx);
+        }
+
+        while let Some(tx) = queue.pop() {
+            handle_tx(conn, tx)?;
+        }
+
+        Ok(())
+    }
+
     #[test]
-    fn should_succeed_on_processing_tx_variant_1() {}
+    fn should_succeed_on_processing_tx_variant_1() {
+        let mut conn = setup().unwrap();
+        let csv = r#"type,client,tx,amount
+deposit,1,1,1.0
+deposit,2,2,2.0
+deposit,1,3,2.0
+withdrawal,1,1,0.0
+withdrawal,2,2,0.0"#;
+        let expected_result = vec![
+            Account {
+                client_id: 1,
+                available: 3.0,
+                held: 0.0,
+                total: 3.0,
+                locked: false,
+            },
+            Account {
+                client_id: 2,
+                available: 2.0,
+                held: 0.0,
+                total: 2.0,
+                locked: false,
+            },
+        ];
+        run(&mut conn, csv).unwrap();
+        assert_eq!(from_sql_table(&conn).unwrap(), expected_result);
+    }
 
-    fn should_succeed_on_processing_tx_variant_2() {}
+    #[test]
+    fn should_succeed_on_processing_tx_variant_2() {
+        let mut conn = setup().unwrap();
+        let csv = r#"type,client,tx,amount
+deposit,1,1,1.0
+deposit,2,2,2.0
+deposit,1,3,2.0
+dispute,1,1,
+dispute,2,2,
+resolve,2,2,
+chargeback,1,1,"#;
+        let expected_result = vec![
+            Account {
+                client_id: 1,
+                available: 2.0,
+                held: 0.0,
+                total: 2.0,
+                locked: true,
+            },
+            Account {
+                client_id: 2,
+                available: 0.0,
+                held: 2.0,
+                total: 2.0,
+                locked: false,
+            },
+        ];
 
-    fn should_succeed_on_processing_tx_variant_3() {}
+        run(&mut conn, csv).unwrap();
+        assert_eq!(from_sql_table(&conn).unwrap(), expected_result);
+    }
 
-    fn should_succeed_on_processing_tx_variant_4() {}
+    #[test]
+    fn should_succeed_on_processing_tx_variant_3() {
+        let mut conn = setup().unwrap();
+        let csv = r#"type,client,tx,amount
+deposit,1,1,1.0
+deposit,2,2,2.0
+deposit,1,3,2.0
+dispute,1,1,
+dispute,2,2,
+resolve,2,2,
+resolve,2,2,
+dispute,1,1,
+chargeback,1,1,
+chargeback,1,1,
+deposit,1,1,1.0"#;
+        let expected_result = vec![
+            Account {
+                client_id: 1,
+                available: 2.0,
+                held: 0.0,
+                total: 2.0,
+                locked: true,
+            },
+            Account {
+                client_id: 2,
+                available: 0.0,
+                held: 2.0,
+                total: 2.0,
+                locked: false,
+            },
+        ];
 
-    fn should_succeed_on_processing_tx_variant_5() {}
+        run(&mut conn, csv).unwrap();
+        assert_eq!(from_sql_table(&conn).unwrap(), expected_result);
+    }
+
+    #[test]
+    fn should_succeed_on_processing_tx_variant_4() {
+        let mut conn = setup().unwrap();
+        let csv = r#"type,client,tx,amount
+deposit,1,1,1.0
+deposit,2,2,2.0
+deposit,1,3,2.0
+deposit,3,4,2.0
+dispute,1,1,
+dispute,2,2,
+resolve,2,2,
+resolve,2,2,
+dispute,1,1,
+withdrawal,3,5,2.0
+chargeback,1,1,
+chargeback,1,1,
+deposit,1,1,1.0"#;
+        let expected_result = vec![
+            Account {
+                client_id: 1,
+                available: 2.0,
+                held: 0.0,
+                total: 2.0,
+                locked: true,
+            },
+            Account {
+                client_id: 2,
+                available: 0.0,
+                held: 2.0,
+                total: 2.0,
+                locked: false,
+            },
+            Account {
+                client_id: 3,
+                available: 0.0,
+                held: 0.0,
+                total: 0.0,
+                locked: false,
+            },
+        ];
+
+        run(&mut conn, csv).unwrap();
+        assert_eq!(from_sql_table(&conn).unwrap(), expected_result);
+    }
 }

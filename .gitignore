@@ -1,4 +1,5 @@
 /target
 *.db
-/src/*.csv
+*/*.csv
 .idea/
+accounts.csv
