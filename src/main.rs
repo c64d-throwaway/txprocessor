@@ -10,7 +10,6 @@ use serde::{de, Deserialize, Deserializer};
 use serde_derive::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::Read;
 use strum_macros::{Display, EnumString};
 
 type ClientId = u16;
@@ -50,8 +49,7 @@ fn from_sql_table(conn: &SqlConnection) -> Result<Vec<Account>> {
         })
         .map_err(anyhow::Error::from)?;
 
-    m
-        .map(|x| x.map_err(anyhow::Error::from))
+    m.map(|x| x.map_err(anyhow::Error::from))
         .collect::<Result<Vec<Account>>>()
 }
 
@@ -112,8 +110,8 @@ enum TxType {
 
 impl<'de> Deserialize<'de> for TxType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -164,8 +162,8 @@ enum TxStatus {
 
 impl<'de> Deserialize<'de> for TxStatus {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
+    where
+        D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -251,14 +249,6 @@ impl TxQueue {
     pub fn pop(&mut self) -> Option<Tx> {
         self.q.pop_front()
     }
-
-    pub fn len(&self) -> usize {
-        self.q.len()
-    }
-
-    pub fn reset(&mut self) {
-        self.q = VecDeque::new();
-    }
 }
 
 fn handle_deposit(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
@@ -315,8 +305,8 @@ fn handle_withdrawal(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
         params![tx.id, tx.tx_type, tx.client_id, tx.amount],
     )
-        .map(|_| ())
-        .context("failed inserting processed transaction on withdrawal")?;
+    .map(|_| ())
+    .context("failed inserting processed transaction on withdrawal")?;
 
     dbtx.commit()
         .map(|_| ())
@@ -355,7 +345,7 @@ fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::InDispute],
     )
-        .context("failed updating tx status on dispute")?;
+    .context("failed updating tx status on dispute")?;
 
     dbtx.execute(
         "UPDATE account SET available_amount = available_amount - ?1, held_amount = held_amount + ?1 WHERE id = ?2;",
@@ -386,7 +376,7 @@ fn handle_resolve(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::Resolved],
     )
-        .context("failed updating tx status on resolve")?;
+    .context("failed updating tx status on resolve")?;
 
     dbtx.execute(
         "UPDATE account SET available_amount = available_amount + ?1, held_amount = held_amount - ?1 WHERE id = ?2;",
@@ -417,14 +407,14 @@ fn handle_chargeback(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::Chargeback],
     )
-        .context("failed updating transaction status on chargeback")?;
+    .context("failed updating transaction status on chargeback")?;
 
     dbtx.execute(
         "UPDATE account SET held_amount = held_amount - ?1, status = ?2 WHERE id = ?3;",
         params![txrecord.amount, AccountStatus::Blocked, txrecord.client_id],
     )
-        .map(|_| ())
-        .context("failed updating account on chargeback")?;
+    .map(|_| ())
+    .context("failed updating account on chargeback")?;
 
     dbtx.commit()
         .map(|_| ())
@@ -455,10 +445,6 @@ fn source_file_from_args() -> Result<String> {
 
     Ok(args[1].clone())
 }
-
-use std::sync::mpsc::{Sender, Receiver};
-use std::sync::mpsc;
-use std::thread;
 
 fn main() -> Result<()> {
     // setup database and connections
@@ -496,8 +482,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod component_tests {
-    use crate::{from_sql_table, handle_tx, migrate_tables, Account, TxQueue, Tx};
-    use anyhow::{Result, Context};
+    use crate::{from_sql_table, handle_tx, migrate_tables, Account, Tx, TxQueue};
+    use anyhow::{Context, Result};
     use rusqlite::Connection as SqlConnection;
     use std::io::Read;
 
