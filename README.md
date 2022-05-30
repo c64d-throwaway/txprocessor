@@ -31,6 +31,8 @@ The application is divided into 5 sections (module-like)
 
 ## Tests
 The tests are minimal. But try to be efficient by testing from simple to complex scenarios.
+There is no unit testing, although I believe there should be, due time constrains and so.
+So you will notice that these are intergratin / components test, quite efficient.
 
 ## Thoughts and future improvements
 ### Lazy reading
