@@ -1,10 +1,10 @@
 extern crate core;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{
     params, types::ToSqlOutput, Connection as SqlConnection, Error as SqlError,
-    Result as SqlResult, ToSql, Transaction as SqlTransaction
+    Result as SqlResult, ToSql, Transaction as SqlTransaction,
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_derive::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
@@ -17,6 +17,83 @@ type ClientId = u16;
 type TxId = u32;
 type Amount = f64;
 
+/// SQL
+#[derive(Debug, SerdeDeserialize)]
+struct SqlTx {
+    pub id: TxId,
+    pub tx_type: TxType,
+    pub client_id: ClientId,
+    pub amount: Amount,
+    pub status: TxStatus,
+}
+
+fn from_sql_table(conn: &SqlConnection) -> Result<Vec<Account>> {
+    let mut q = conn
+        .prepare("SELECT id, available_amount, held_amount, locked, status from account;")
+        .map_err(anyhow::Error::from)?;
+
+    let m = q
+        .query_map([], |row| {
+            let available = row.get(1)?;
+            let held = row.get(2)?;
+            let total = available + held;
+            let status: String = row.get(4)?;
+            let locked = status == AccountStatus::Blocked.to_string();
+
+            Ok(Account {
+                client_id: row.get(0)?,
+                available,
+                held,
+                total,
+                locked,
+            })
+        })
+        .map_err(anyhow::Error::from)?;
+
+    let a = m.map(|x| x.map_err(anyhow::Error::from)).collect::<Result<Vec<Account>>>();
+
+    a
+}
+
+fn migrate_tables(conn: &mut SqlConnection) -> Result<()> {
+    let dbtx = conn.transaction()?;
+    dbtx.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT 'processed');", [])
+        .context("failed migrating tx table")?;
+
+    dbtx.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, available_amount DOUBLE PRECISION , held_amount DOUBLE PRECISION, locked BOOLEAN, status TEXT DEFAULT 'active');", [])
+        .context("failed migrating account table").map(|_| ())?;
+
+    dbtx.commit()
+        .map(|_| ())
+        .context("failed committing migrations")
+}
+
+/// CSV
+fn to_csv(accounts: Vec<Account>) -> Result<String> {
+    let buf = Vec::new();
+    let mut builder = csv::WriterBuilder::new().from_writer(buf);
+
+    for acc in accounts {
+        builder.serialize(acc)?;
+    }
+
+    let bytes = builder
+        .into_inner()
+        .context("failed flushing into buffer or file")?;
+    String::from_utf8(bytes).context("failed converting csv to string from byte vector")
+}
+
+fn read_csv(rdr: impl Read) -> Result<Vec<Tx>> {
+    let mut b = csv::Reader::from_reader(rdr);
+    b.deserialize()
+        .map(|x| {
+            let tx: Tx = x.context("failed deserializing csv record into a transaction")?;
+            Ok(tx)
+        })
+        .collect::<Result<_>>()
+}
+
+/// General domain types and functions
 #[derive(Debug, SerdeDeserialize)]
 struct Tx {
     #[serde(rename(deserialize = "tx"))]
@@ -27,16 +104,6 @@ struct Tx {
     pub client_id: ClientId,
     // FIXME
     pub amount: String,
-}
-
-#[derive(Debug, SerdeDeserialize)]
-struct SqlTx {
-    pub id: TxId,
-    pub tx_type: TxType,
-    pub client_id: ClientId,
-    // FIXME
-    pub amount: f64,
-    pub status: TxStatus,
 }
 
 #[derive(Debug, EnumString, Display)]
@@ -176,58 +243,6 @@ struct Account {
     pub held: Amount,
     pub total: Amount,
     pub locked: bool,
-}
-
-fn to_csv(accounts: Vec<Account>) -> Result<String> {
-    let buf = Vec::new();
-    let mut builder = csv::WriterBuilder::new().from_writer(buf);
-
-    for acc in accounts {
-        builder.serialize(acc)?;
-    }
-
-    let bytes = builder
-        .into_inner()
-        .context("failed flushing into buffer or file")?;
-    String::from_utf8(bytes).context("failed converting csv to string from byte vector")
-}
-
-fn from_sql_table(conn: &SqlConnection) -> Result<Vec<Account>> {
-    let mut q = conn
-        .prepare("SELECT id, available_amount, held_amount, locked, status from account;")
-        .map_err(anyhow::Error::from)?;
-
-    let m = q
-        .query_map([], |row| {
-            let available = row.get(1)?;
-            let held = row.get(2)?;
-            let total = available + held;
-            let status: String = row.get(4)?;
-            let locked = status == AccountStatus::Blocked.to_string();
-
-            Ok(Account {
-                client_id: row.get(0)?,
-                available,
-                held,
-                total,
-                locked,
-            })
-        })
-        .map_err(anyhow::Error::from)?;
-
-    let a = m.map(|x| x.unwrap()).collect::<_>();
-
-    Ok(a)
-}
-
-fn read_csv(rdr: impl Read) -> Result<Vec<Tx>> {
-    let mut b = csv::Reader::from_reader(rdr);
-    b.deserialize()
-        .map(|x| {
-            let tx: Tx = x.context("failed deserializing csv record into a transaction")?;
-            Ok(tx)
-        })
-        .collect::<Result<_>>()
 }
 
 struct TxQueue {
@@ -430,26 +445,13 @@ fn handle_tx(conn: &mut SqlConnection, tx: Tx) -> Result<()> {
     }
 }
 
-fn migrate_tables(conn: &mut SqlConnection) -> Result<()> {
-    let dbtx = conn.transaction()?;
-    dbtx.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT 'processed');", [])
-        .context("failed migrating tx table")?;
-
-    dbtx.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, available_amount DOUBLE PRECISION , held_amount DOUBLE PRECISION, locked BOOLEAN, status TEXT DEFAULT 'active');", [])
-        .context("failed migrating account table").map(|_| ())?;
-
-    dbtx.commit()
-        .map(|_| ())
-        .context("failed committing migrations")
-}
-
+// CLI app related types and functions
 fn source_file_from_args() -> Result<String> {
     let args: Vec<String> = std::env::args().collect();
-
-    if args.len() > 2 {
+    println!("{}", args.len());
+    if args.len() < 2 {
         return Err(anyhow::anyhow!(
-            "expected 1 argument, got {}. Try cargo run -- transactions.csv > accounts.csv",
-            args.len()
+            "too few arguments: cargo run -- <input_file>.csv > <output_file>.csv"
         ));
     }
 
@@ -473,8 +475,12 @@ fn main() -> Result<()> {
         handle_tx(&mut conn, tx)?;
     }
 
-    println!("{}", to_csv(from_sql_table(&conn)?)?);
-    conn.close().unwrap();
+    print!("{}", to_csv(from_sql_table(&conn)?)?);
+
+    if let Err(e) = conn.close() {
+        return Err(anyhow!("failed closing database connection {}", e.1));
+    }
+
     Ok(())
 }
 
@@ -485,7 +491,7 @@ mod component_tests {
     use rusqlite::Connection as SqlConnection;
 
     fn setup() -> Result<SqlConnection> {
-        let mut conn = SqlConnection::open_in_memory().unwrap();
+        let mut conn = SqlConnection::open_in_memory()?;
         migrate_tables(&mut conn)?;
 
         return Ok(conn);
