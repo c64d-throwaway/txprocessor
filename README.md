@@ -29,6 +29,9 @@ The application is divided into 5 sections (module-like)
 - Domain - the general types playing the most central role in the application
 - Main - executable entrypoint
 
+## Tests
+The tests are minimal. But try to be efficient by testing from simple to complex scenarios.
+
 ## Thoughts and future improvements
 ### Lazy reading
 The CSV is being read line for line with a Reader "object". A sensible implementation  
