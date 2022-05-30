@@ -1,8 +1,10 @@
+extern crate core;
+
 use anyhow::{Context, Result};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{
     params, types::ToSqlOutput, Connection as SqlConnection, Error as SqlError,
-    Result as SqlResult, ToSql,
+    Result as SqlResult, ToSql, Transaction as SqlTransaction
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_derive::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
@@ -53,8 +55,8 @@ enum TxType {
 
 impl<'de> Deserialize<'de> for TxType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
+        where
+            D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -105,8 +107,8 @@ enum TxStatus {
 
 impl<'de> Deserialize<'de> for TxStatus {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
+        where
+            D: Deserializer<'de>,
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
 
@@ -259,32 +261,18 @@ fn handle_deposit(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         return dbtx.rollback().context("failed rolling back transaction");
     }
 
-    if let Err(e) = dbtx.execute(
+    dbtx.execute(
         "INSERT OR IGNORE INTO account (id, available_amount, held_amount, locked, status) VALUES (?1, ?2, ?3, ?4, ?5);",
-        params![tx.client_id, 0f64, 0f64, false, AccountStatus::Active])
-    {
-        dbtx.rollback().context("failed rolling back transaction")?;
-        return Err(anyhow::Error::new(e));
-    }
+        params![tx.client_id, 0f64, 0f64, false, AccountStatus::Active])?;
 
-    if let Err(e) = dbtx.execute(
+    dbtx.execute(
         "UPDATE account SET available_amount = available_amount + ?1 WHERE id = ?2 AND status = ?3;",
-        params![tx.amount, tx.client_id, AccountStatus::Active])
-    {
-        dbtx.rollback().context("failed rolling back transaction")?;
-        return Err(anyhow::Error::new(e));
-    }
+        params![tx.amount, tx.client_id, AccountStatus::Active])?;
 
-    if let Err(e) = dbtx
-        .execute(
-            "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
-            params![tx.id, tx.tx_type, tx.client_id, tx.amount],
-        )
-        .map(|_| ())
-    {
-        dbtx.rollback().context("failed rolling back transaction")?;
-        return Err(anyhow::Error::new(e));
-    }
+    dbtx.execute(
+        "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
+        params![tx.id, tx.tx_type, tx.client_id, tx.amount],
+    )?;
 
     dbtx.commit()
         .map(|_| ())
@@ -314,20 +302,18 @@ fn handle_withdrawal(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "INSERT OR IGNORE INTO tx (id, tx_type, client_id, amount) values (?1, ?2, ?3, ?4);",
         params![tx.id, tx.tx_type, tx.client_id, tx.amount],
     )
-    .map(|_| ())
-    .context("failed inserting processed transaction on withdrawal")?;
+        .map(|_| ())
+        .context("failed inserting processed transaction on withdrawal")?;
 
     dbtx.commit()
         .map(|_| ())
         .context("failed committing on withdrawal")
 }
 
-fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
-    let dbtx = conn.transaction()?;
-
-    let txrecordres = dbtx.query_row(
+fn handle_missing_tx(dbtx: &SqlTransaction, tx: &Tx, tx_status: TxStatus) -> SqlResult<SqlTx> {
+    dbtx.query_row(
         "SELECT id, tx_type, client_id, amount, status FROM tx WHERE status = ?3 AND client_id = ?1 AND id = ?2;",
-        params![&tx.client_id, &tx.id, TxStatus::Processed.to_string()], |r| {
+        params![&tx.client_id, &tx.id, tx_status], |r| {
             let id: u32 = r.get(0)?;
             Ok(SqlTx {
                 id,
@@ -336,9 +322,12 @@ fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
                 amount: r.get(3)?,
                 status: r.get(4)?,
             })
-        });
+        })
+}
 
-    let txrecord = match txrecordres {
+fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
+    let dbtx = conn.transaction()?;
+    let txrecord = match handle_missing_tx(&dbtx, tx, TxStatus::Processed) {
         Ok(txrecord) => txrecord,
         Err(e) => {
             if e == SqlError::QueryReturnedNoRows {
@@ -353,7 +342,7 @@ fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::InDispute],
     )
-    .context("failed updating tx status on dispute")?;
+        .context("failed updating tx status on dispute")?;
 
     dbtx.execute(
         "UPDATE account SET available_amount = available_amount - ?1, held_amount = held_amount + ?1 WHERE id = ?2;",
@@ -369,21 +358,7 @@ fn handle_dispute(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
 
 fn handle_resolve(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
     let dbtx = conn.transaction()?;
-
-    let txrecordres = dbtx.query_row(
-        "SELECT id, tx_type, client_id, amount, status FROM tx WHERE status = ?3 AND client_id = ?1 AND id = ?2;",
-        params![&tx.client_id, &tx.id, TxStatus::Processed.to_string()], |r| {
-            let id: u32 = r.get(0)?;
-            Ok(SqlTx {
-                id,
-                tx_type: r.get(1)?,
-                client_id: r.get(2)?,
-                amount: r.get(3)?,
-                status: r.get(4)?,
-            })
-        });
-
-    let txrecord = match txrecordres {
+    let txrecord = match handle_missing_tx(&dbtx, tx, TxStatus::InDispute) {
         Ok(txrecord) => txrecord,
         Err(e) => {
             if e == SqlError::QueryReturnedNoRows {
@@ -398,7 +373,7 @@ fn handle_resolve(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::Resolved],
     )
-    .context("failed updating tx status on resolve")?;
+        .context("failed updating tx status on resolve")?;
 
     dbtx.execute(
         "UPDATE account SET available_amount = available_amount + ?1, held_amount = held_amount - ?1 WHERE id = ?2;",
@@ -414,21 +389,7 @@ fn handle_resolve(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
 
 fn handle_chargeback(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
     let dbtx = conn.transaction()?;
-
-    let txrecordres = dbtx.query_row(
-        "SELECT id, tx_type, client_id, amount, status FROM tx WHERE status = ?3 AND client_id = ?1 AND id = ?2;",
-        params![&tx.client_id, &tx.id, TxStatus::InDispute], |r| {
-            let id: u32 = r.get(0)?;
-            Ok(SqlTx {
-                id,
-                tx_type: r.get(1)?,
-                client_id: r.get(2)?,
-                amount: r.get(3)?,
-                status: r.get(4)?,
-            })
-        });
-
-    let txrecord = match txrecordres {
+    let txrecord = match handle_missing_tx(&dbtx, tx, TxStatus::InDispute) {
         Ok(txrecord) => txrecord,
         Err(e) => {
             if e == SqlError::QueryReturnedNoRows {
@@ -443,14 +404,14 @@ fn handle_chargeback(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
         "UPDATE tx SET status = ?2 WHERE id = ?1;",
         params![&txrecord.id, TxStatus::Chargeback],
     )
-    .context("failed updating transaction status on chargeback")?;
+        .context("failed updating transaction status on chargeback")?;
 
     dbtx.execute(
         "UPDATE account SET held_amount = held_amount - ?1, status = ?2 WHERE id = ?3;",
         params![txrecord.amount, AccountStatus::Blocked, txrecord.client_id],
     )
-    .map(|_| ())
-    .context("failed updating account on chargeback")?;
+        .map(|_| ())
+        .context("failed updating account on chargeback")?;
 
     dbtx.commit()
         .map(|_| ())
@@ -469,12 +430,17 @@ fn handle_tx(conn: &mut SqlConnection, tx: Tx) -> Result<()> {
     }
 }
 
-fn migrate_tables(conn: &SqlConnection) -> Result<()> {
-    conn.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT 'processed');", [])
+fn migrate_tables(conn: &mut SqlConnection) -> Result<()> {
+    let dbtx = conn.transaction()?;
+    dbtx.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY, tx_type TEXT, client_id INTEGER, amount DOUBLE PRECISION, status TEXT DEFAULT 'processed');", [])
         .context("failed migrating tx table")?;
 
-    conn.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, available_amount DOUBLE PRECISION , held_amount DOUBLE PRECISION, locked BOOLEAN, status TEXT DEFAULT 'active');", [])
-        .context("failed migrating account table").map(|_| ())
+    dbtx.execute("CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, available_amount DOUBLE PRECISION , held_amount DOUBLE PRECISION, locked BOOLEAN, status TEXT DEFAULT 'active');", [])
+        .context("failed migrating account table").map(|_| ())?;
+
+    dbtx.commit()
+        .map(|_| ())
+        .context("failed committing migrations")
 }
 
 fn source_file_from_args() -> Result<String> {
@@ -492,7 +458,7 @@ fn source_file_from_args() -> Result<String> {
 
 fn main() -> Result<()> {
     let mut conn = SqlConnection::open("test.db")?;
-    migrate_tables(&conn)?;
+    migrate_tables(&mut conn)?;
     let input_path = source_file_from_args()?;
 
     let txfile = OpenOptions::new().read(true).open(&input_path)?;
@@ -519,8 +485,8 @@ mod component_tests {
     use rusqlite::Connection as SqlConnection;
 
     fn setup() -> Result<SqlConnection> {
-        let conn = SqlConnection::open_in_memory().unwrap();
-        migrate_tables(&conn)?;
+        let mut conn = SqlConnection::open_in_memory().unwrap();
+        migrate_tables(&mut conn)?;
 
         return Ok(conn);
     }
@@ -540,6 +506,16 @@ mod component_tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    #[should_panic]
+    fn should_fail_on_invalid_tx_type() {
+        let mut conn = setup().unwrap();
+        let csv = r#"type,client,tx,amount
+wrong_type,1,1,1.0"#;
+
+        run(&mut conn, csv).unwrap();
     }
 
     #[test]
@@ -592,8 +568,8 @@ chargeback,1,1,"#;
             },
             Account {
                 client_id: 2,
-                available: 0.0,
-                held: 2.0,
+                available: 2.0,
+                held: 0.0,
                 total: 2.0,
                 locked: false,
             },
@@ -628,8 +604,8 @@ deposit,1,1,1.0"#;
             },
             Account {
                 client_id: 2,
-                available: 0.0,
-                held: 2.0,
+                available: 2.0,
+                held: 0.0,
                 total: 2.0,
                 locked: false,
             },
@@ -666,8 +642,8 @@ deposit,1,1,1.0"#;
             },
             Account {
                 client_id: 2,
-                available: 0.0,
-                held: 2.0,
+                available: 2.0,
+                held: 0.0,
                 total: 2.0,
                 locked: false,
             },
