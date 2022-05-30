@@ -434,7 +434,7 @@ fn handle_tx(conn: &mut SqlConnection, tx: Tx) -> Result<()> {
 // CLI app related types and functions
 fn source_file_from_args() -> Result<String> {
     let args: Vec<String> = std::env::args().collect();
-    println!("{}", args.len());
+
     if args.len() < 2 {
         return Err(anyhow::anyhow!(
             "too few arguments: cargo run -- <input_file>.csv > <output_file>.csv"
