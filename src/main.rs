@@ -251,6 +251,14 @@ impl TxQueue {
     pub fn pop(&mut self) -> Option<Tx> {
         self.q.pop_front()
     }
+
+    pub fn len(&self) -> usize {
+        self.q.len()
+    }
+
+    pub fn reset(&mut self) {
+        self.q = VecDeque::new();
+    }
 }
 
 fn handle_deposit(conn: &mut SqlConnection, tx: &Tx) -> Result<()> {
@@ -448,16 +456,17 @@ fn source_file_from_args() -> Result<String> {
     Ok(args[1].clone())
 }
 
+use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc;
+use std::thread;
+
 fn main() -> Result<()> {
     // setup database and connections
     let mut conn = SqlConnection::open("test.db")?;
     migrate_tables(&mut conn)?;
-
+    let mut queue = TxQueue::new();
     // get cli args
     let input_path = source_file_from_args()?;
-
-    // set up queue
-    let mut queue = TxQueue::new();
 
     // read from CSV
     let txfile = OpenOptions::new().read(true).open(&input_path)?;
@@ -465,7 +474,6 @@ fn main() -> Result<()> {
     let mut raw_record = csv::StringRecord::new();
     let headers = rdr.headers()?.clone();
 
-    // push to queue
     while rdr.read_record(&mut raw_record)? {
         let tx: Tx = raw_record.deserialize(Some(&headers))?;
         queue.push(tx);
