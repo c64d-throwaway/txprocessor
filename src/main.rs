@@ -50,9 +50,9 @@ fn from_sql_table(conn: &SqlConnection) -> Result<Vec<Account>> {
         })
         .map_err(anyhow::Error::from)?;
 
-    let a = m.map(|x| x.map_err(anyhow::Error::from)).collect::<Result<Vec<Account>>>();
-
-    a
+    m
+        .map(|x| x.map_err(anyhow::Error::from))
+        .collect::<Result<Vec<Account>>>()
 }
 
 fn migrate_tables(conn: &mut SqlConnection) -> Result<()> {
@@ -81,16 +81,6 @@ fn to_csv(accounts: Vec<Account>) -> Result<String> {
         .into_inner()
         .context("failed flushing into buffer or file")?;
     String::from_utf8(bytes).context("failed converting csv to string from byte vector")
-}
-
-fn read_csv(rdr: impl Read) -> Result<Vec<Tx>> {
-    let mut b = csv::Reader::from_reader(rdr);
-    b.deserialize()
-        .map(|x| {
-            let tx: Tx = x.context("failed deserializing csv record into a transaction")?;
-            Ok(tx)
-        })
-        .collect::<Result<_>>()
 }
 
 /// General domain types and functions
@@ -459,22 +449,34 @@ fn source_file_from_args() -> Result<String> {
 }
 
 fn main() -> Result<()> {
+    // setup database and connections
     let mut conn = SqlConnection::open("test.db")?;
     migrate_tables(&mut conn)?;
+
+    // get cli args
     let input_path = source_file_from_args()?;
 
-    let txfile = OpenOptions::new().read(true).open(&input_path)?;
-    let txs = read_csv(txfile)?;
+    // set up queue
     let mut queue = TxQueue::new();
 
-    for tx in txs {
+    // read from CSV
+    let txfile = OpenOptions::new().read(true).open(&input_path)?;
+    let mut rdr = csv::Reader::from_reader(txfile);
+    let mut raw_record = csv::StringRecord::new();
+    let headers = rdr.headers()?.clone();
+
+    // push to queue
+    while rdr.read_record(&mut raw_record)? {
+        let tx: Tx = raw_record.deserialize(Some(&headers))?;
         queue.push(tx);
     }
 
+    // read from queue
     while let Some(tx) = queue.pop() {
         handle_tx(&mut conn, tx)?;
     }
 
+    // out
     print!("{}", to_csv(from_sql_table(&conn)?)?);
 
     if let Err(e) = conn.close() {
@@ -486,9 +488,10 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod component_tests {
-    use crate::{from_sql_table, handle_tx, migrate_tables, read_csv, Account, TxQueue};
-    use anyhow::Result;
+    use crate::{from_sql_table, handle_tx, migrate_tables, Account, TxQueue, Tx};
+    use anyhow::{Result, Context};
     use rusqlite::Connection as SqlConnection;
+    use std::io::Read;
 
     fn setup() -> Result<SqlConnection> {
         let mut conn = SqlConnection::open_in_memory()?;
@@ -512,6 +515,16 @@ mod component_tests {
         }
 
         Ok(())
+    }
+
+    fn read_csv(rdr: impl Read) -> Result<Vec<Tx>> {
+        let mut b = csv::ReaderBuilder::new().from_reader(rdr);
+        b.deserialize()
+            .map(|x| {
+                let tx: Tx = x.context("failed deserializing csv record into a transaction")?;
+                Ok(tx)
+            })
+            .collect::<Result<_>>()
     }
 
     #[test]
